@@ -90,6 +90,53 @@ class SchemaTests(unittest.TestCase):
                 m.validate_health_url(value)
 
 
+class DiagnosticTests(unittest.TestCase):
+    def test_only_finite_health_labels_and_error_codes_are_logged(self):
+        for reason in list(m.NAMES.values()) + ["health publication freshness"]:
+            self.assertEqual(m.safe_health_detail(False, reason), reason)
+        self.assertEqual(m.safe_health_detail(False, ", ".join(m.NAMES.values())),
+                         ", ".join(sorted(m.NAMES.values())))
+        for code in m.HEALTH_ERROR_CODES:
+            self.assertEqual(m.safe_health_detail(False, error=m.MonitorError(code)), code)
+        for untrusted in ["https://secret.invalid/?token=private-value", "password=private-value", "request_failed: private-value"]:
+            self.assertEqual(m.safe_health_detail(False, untrusted), "health_assessment_failed")
+            self.assertEqual(m.safe_health_detail(False, error=m.MonitorError(untrusted)), "health_assessment_failed")
+
+    def run_main(self, store, response=None, error=None):
+        output, sender = io.StringIO(), mock.Mock()
+        with mock.patch.dict(os.environ, {"TEST_MODE": "none", "HEALTH_URL": "https://example.test/security-health.json"}), \
+             mock.patch.object(m, "request_json", return_value=response, side_effect=error), \
+             mock.patch.object(m, "utc_now", return_value=NOW), \
+             mock.patch.object(m, "GitHubState", return_value=store), \
+             mock.patch.object(m, "send_telegram", sender), \
+             mock.patch("sys.stdout", output):
+            exit_code = m.main()
+        return exit_code, json.loads(output.getvalue()), sender
+
+    def test_actual_failed_check_logged_without_duplicate_send(self):
+        store, value = Store(), health()
+        value["ok"] = value["checks"]["coverage_current"] = False
+        status, first, first_sender = self.run_main(store, value)
+        self.assertEqual(status, 1)
+        self.assertEqual(first["health_reason"], "security coverage freshness")
+        self.assertEqual(first_sender.call_count, 1)
+        status, second, second_sender = self.run_main(store, value)
+        self.assertEqual(second["result"], "unchanged")
+        second_sender.assert_not_called()
+        self.assertEqual(store.value["sequence"], 1)
+
+    def test_error_diagnostic_redacted_and_recovery_preserves_transition(self):
+        store = Store()
+        status, failure, sender = self.run_main(store, error=m.MonitorError("request_failed"))
+        self.assertEqual(failure["health_reason"], "request_failed")
+        status, recovery, sender = self.run_main(store, health())
+        self.assertEqual((status, recovery["result"], recovery["health_reason"]), (0, "recovery_sent", "healthy"))
+        self.assertEqual(store.value["sequence"], 2)
+        self.assertEqual(sender.call_count, 1)
+        _, redacted, _ = self.run_main(Store(), error=m.MonitorError("https://secret.invalid/?token=private-value"))
+        self.assertNotIn("private-value", json.dumps(redacted))
+
+
 class TransitionTests(unittest.TestCase):
     def test_initial_healthy_has_no_message(self):
         store, sender = Store(), mock.Mock()

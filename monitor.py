@@ -20,6 +20,23 @@ NAMES = {"collector_fresh": "health collector freshness", "webhook_running": "we
          "private_alert_worker_fresh": "private alert worker freshness",
          "coverage_current": "security coverage freshness", "backup_fresh": "backup freshness"}
 TITLES = {"production": "Security monitor state: production", "test": "Security monitor state: test"}
+HEALTH_ERROR_CODES = frozenset({"redirect_rejected", "request_timeout", "request_failed",
+    "unexpected_http_response", "response_too_large", "invalid_timestamp", "duplicate_json_key",
+    "invalid_json_number", "invalid_json", "invalid_health_schema", "inconsistent_health_schema"})
+
+
+def safe_health_detail(healthy, reason="", error=None):
+    """Only finite local labels reach public logs; never echo arbitrary exception text."""
+    if error is not None:
+        return str(error) if str(error) in HEALTH_ERROR_CODES else "health_assessment_failed"
+    if healthy:
+        return "healthy"
+    if reason == "health publication freshness":
+        return reason
+    parts = reason.split(", ") if isinstance(reason, str) else []
+    if parts and len(parts) <= len(NAMES) and all(part in NAMES.values() for part in parts):
+        return ", ".join(sorted(set(parts)))
+    return "health_assessment_failed"
 
 
 class MonitorError(Exception):
@@ -260,16 +277,20 @@ def main():
     if mode == "none":
         try:
             healthy, reason = assess_health(request_json(url))
-        except MonitorError:
+            detail = safe_health_detail(healthy, reason)
+        except MonitorError as error:
+            detail = safe_health_detail(False, error=error)
             healthy, reason = False, "health endpoint unavailable or invalid"
     else:
         healthy, reason = mode == "recovery", "synthetic failure"
+        detail = "synthetic_" + mode
     issue_key = "PRODUCTION_STATE_ISSUE_ID" if namespace == "production" else "TEST_STATE_ISSUE_ID"
     store = GitHubState(os.environ.get("GITHUB_REPOSITORY", ""), os.environ.get("GITHUB_TOKEN", ""),
                         namespace, os.environ.get(issue_key, ""))
     result = transition(store, healthy, reason,
                         lambda message: send_telegram(os.environ.get("ALERT_BOT_TOKEN", ""), os.environ.get("ALERT_CHAT_ID", ""), message), namespace)
-    print(json.dumps({"namespace": namespace, "healthy": healthy, "result": result}))
+    print(json.dumps({"namespace": namespace, "healthy": healthy, "result": result,
+                      "health_reason": detail}))
     return 0 if healthy or mode != "none" else 1
 
 
